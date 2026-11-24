@@ -1,0 +1,38 @@
+{
+  "name": "llm-json-guard",
+  "version": "0.1.0",
+  "description": "Zero-dependency parser that extracts, repairs, and parses malformed or truncated JSON from LLM responses.",
+  "keywords": ["llm", "json", "parser", "repair", "ai", "structured-output", "typescript"],
+  "license": "MIT",
+  "author": "jayparmarr",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jayparmarr/llm-json-guard.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsdown src/index.ts --format esm,cjs --dts --clean",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "tsdown": "^0.11.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
