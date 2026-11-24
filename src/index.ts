@@ -1,170 +1,285 @@
-export interface ParseSuccess<T> {
-  ok: true;
-  data: T;
-  repaired: boolean;
+export interface ParseOptions {
+  /** Attempt to close unclosed brackets, braces, and strings from truncated LLM output. Default: true */
+  repairTruncation?: boolean;
+  /** Strip trailing commas before `}` or `]`. Default: true */
+  stripTrailingCommas?: boolean;
+  /** Normalize Python-style single-quoted strings and unquoted object keys. Default: true */
+  normalizeQuotesAndKeys?: boolean;
 }
 
-export interface ParseFailure {
-  ok: false;
-  error: string;
-  raw: string;
-}
-
-export type ParseResult<T> = ParseSuccess<T> | ParseFailure;
+export type ParseResult<T = unknown> =
+  | {
+      ok: true;
+      data: T;
+      repaired: boolean;
+      rawExtracted: string;
+    }
+  | {
+      ok: false;
+      error: string;
+      rawExtracted: string;
+    };
 
 /**
- * Extracts and repairs malformed or truncated JSON from raw LLM text output.
+ * Extracts, repairs, and safely parses JSON from raw LLM text responses.
  */
-export function parseLLMJson<T = unknown>(input: string): ParseResult<T> {
-  const trimmed = input.trim();
-  if (!trimmed) {
-    return { ok: false, error: "Input string is empty", raw: input };
+export function parseLLMJson<T = unknown>(
+  input: string,
+  options: ParseOptions = {}
+): ParseResult<T> {
+  const {
+    repairTruncation = true,
+    stripTrailingCommas = true,
+    normalizeQuotesAndKeys = true,
+  } = options;
+
+  if (!input || typeof input !== "string") {
+    return { ok: false, error: "Input must be a non-empty string.", rawExtracted: "" };
+  }
+
+  const extracted = extractJsonCandidate(input);
+  if (!extracted) {
+    return { ok: false, error: "No JSON object or array found in input.", rawExtracted: "" };
   }
 
   // Fast path: already valid JSON
   try {
-    return { ok: true, data: JSON.parse(trimmed) as T, repaired: false };
+    const parsed = JSON.parse(extracted) as T;
+    return { ok: true, data: parsed, repaired: false, rawExtracted: extracted };
   } catch {
-    // Proceed to extraction and repair
+    // Proceed to deterministic repair pipeline
+  }
+
+  let candidate = extracted;
+
+  if (normalizeQuotesAndKeys) {
+    candidate = normalizeLooseJson(candidate);
+  }
+
+  if (stripTrailingCommas) {
+    candidate = removeTrailingCommas(candidate);
+  }
+
+  if (repairTruncation) {
+    candidate = closeTruncatedJson(candidate);
+    if (stripTrailingCommas) {
+      candidate = removeTrailingCommas(candidate);
+    }
   }
 
   try {
-    const extracted = extractJsonBlock(trimmed);
-    const cleaned = repairJsonSyntax(extracted);
-    const closed = autoCloseTruncated(cleaned);
-    const parsed = JSON.parse(closed) as T;
-    return { ok: true, data: parsed, repaired: true };
+    const parsed = JSON.parse(candidate) as T;
+    return { ok: true, data: parsed, repaired: true, rawExtracted: extracted };
   } catch (err) {
     return {
       ok: false,
-      error: err instanceof Error ? err.message : "Failed to repair JSON",
-      raw: input,
+      error: err instanceof Error ? err.message : "Failed to parse repaired JSON.",
+      rawExtracted: extracted,
     };
   }
 }
 
-function extractJsonBlock(text: string): string {
-  // 1. Prefer fenced ```json ... ``` or ``` ... ``` blocks
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)(?:```|$)/i);
-  if (fenceMatch?.[1]) {
-    return fenceMatch[1].trim();
-  }
-
-  // 2. Otherwise slice from first '{' or '['
-  const firstObj = text.indexOf("{");
-  const firstArr = text.indexOf("[");
-  let start = -1;
-
-  if (firstObj !== -1 && firstArr !== -1) {
-    start = Math.min(firstObj, firstArr);
-  } else {
-    start = Math.max(firstObj, firstArr);
-  }
-
-  if (start === -1) return text;
-  return text.slice(start).trim();
+/**
+ * Parses incomplete/in-flight JSON chunks emitted during LLM token streaming.
+ * Returns `null` until at least a partial object or array structure is recoverable.
+ */
+export function parseStreamingJson<T = unknown>(partialStream: string): T | null {
+  const result = parseLLMJson<T>(partialStream, {
+    repairTruncation: true,
+    stripTrailingCommas: true,
+    normalizeQuotesAndKeys: true,
+  });
+  return result.ok ? result.data : null;
 }
 
-function repairJsonSyntax(text: string): string {
+function extractJsonCandidate(text: string): string {
+  const trimmed = text.trim();
+
+  // 1. Check fenced markdown code blocks (closed or unclosed/truncated)
+  const closedFenceMatch = trimmed.match(/```(?:json|JSON)?\s*([\s\S]*?)```/);
+  if (closedFenceMatch?.[1]) {
+    return closedFenceMatch[1].trim();
+  }
+
+  const openFenceMatch = trimmed.match(/```(?:json|JSON)?\s*([\s\S]*)$/);
+  if (openFenceMatch?.[1]) {
+    return openFenceMatch[1].trim();
+  }
+
+  // 2. Locate first opening `{` or `[`
+  const firstBrace = trimmed.indexOf("{");
+  const firstBracket = trimmed.indexOf("[");
+
+  let start = -1;
+  if (firstBrace !== -1 && firstBracket !== -1) {
+    start = Math.min(firstBrace, firstBracket);
+  } else {
+    start = Math.max(firstBrace, firstBracket);
+  }
+
+  if (start === -1) return "";
+
+  const slice = trimmed.slice(start);
+
+  // Trim trailing conversational commentary after the final closing token if balanced
+  const lastBrace = slice.lastIndexOf("}");
+  const lastBracket = slice.lastIndexOf("]");
+  const end = Math.max(lastBrace, lastBracket);
+
+  if (end !== -1 && isBalancedOutsideStrings(slice.slice(0, end + 1))) {
+    return slice.slice(0, end + 1).trim();
+  }
+
+  return slice.trim();
+}
+
+function normalizeLooseJson(json: string): string {
+  let out = "";
+  let inDouble = false;
+  let inSingle = false;
+  let escape = false;
+
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i]!;
+
+    if (escape) {
+      out += ch;
+      escape = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      out += ch;
+      escape = true;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      out += ch;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      out += '"';
+      continue;
+    }
+
+    if (inSingle && ch === '"') {
+      out += '\\"';
+      continue;
+    }
+
+    out += ch;
+  }
+
+  // Quote unquoted object keys outside strings: `{ foo: "bar" }` -> `{ "foo": "bar" }`
+  return out.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$-]*)(\s*:)/g, '$1"$2"$3');
+}
+
+function isBalancedOutsideStrings(str: string): boolean {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (!inString) {
+      if (ch === "{" || ch === "[") depth++;
+      else if (ch === "}" || ch === "]") depth--;
+    }
+  }
+  return depth === 0 && !inString;
+}
+
+function removeTrailingCommas(json: string): string {
   let result = "";
   let inString = false;
-  let escapeNext = false;
+  let escape = false;
 
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i]!;
-
-    if (escapeNext) {
-      result += char;
-      escapeNext = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i]!;
+    if (escape) {
+      result += ch;
+      escape = false;
       continue;
     }
-
-    if (char === "\\" && inString) {
-      result += char;
-      escapeNext = true;
+    if (ch === "\\") {
+      result += ch;
+      escape = true;
       continue;
     }
-
-    if (char === '"') {
+    if (ch === '"') {
       inString = !inString;
-      result += char;
+      result += ch;
       continue;
     }
-
-    // Escape raw newlines/tabs inside string literals
-    if (inString) {
-      if (char === "\n") {
-        result += "\\n";
-        continue;
-      }
-      if (char === "\r") {
-        result += "\\r";
-        continue;
-      }
-      if (char === "\t") {
-        result += "\\t";
+    if (!inString && ch === ",") {
+      let j = i + 1;
+      while (j < json.length && /\s/.test(json[j]!)) j++;
+      if (json[j] === "}" || json[j] === "]") {
         continue;
       }
     }
-
-    result += char;
+    result += ch;
   }
-
-  // Strip trailing commas before closing brackets/braces
-  return result.replace(/,\s*([}\]])/g, "$1");
+  return result;
 }
 
-function autoCloseTruncated(text: string): string {
+function closeTruncatedJson(json: string): string {
   const stack: string[] = [];
   let inString = false;
-  let escapeNext = false;
-  let lastValidEnd = text.length;
+  let escape = false;
 
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i]!;
-
-    if (escapeNext) {
-      escapeNext = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i]!;
+    if (escape) {
+      escape = false;
       continue;
     }
-    if (char === "\\" && inString) {
-      escapeNext = true;
+    if (ch === "\\") {
+      escape = true;
       continue;
     }
-    if (char === '"') {
+    if (ch === '"') {
       inString = !inString;
       continue;
     }
-    if (inString) continue;
-
-    if (char === "{") stack.push("}");
-    else if (char === "[") stack.push("]");
-    else if (char === "}" || char === "]") {
-      stack.pop();
-      if (stack.length === 0) {
-        lastValidEnd = i + 1;
-        break;
+    if (!inString) {
+      if (ch === "{") stack.push("}");
+      else if (ch === "[") stack.push("]");
+      else if ((ch === "}" || ch === "]") && stack.length > 0) {
+        stack.pop();
       }
     }
   }
 
-  // Trim trailing conversational text after root JSON closes
-  let output = stack.length === 0 ? text.slice(0, lastValidEnd) : text;
+  let repaired = json.trimEnd();
 
-  // Close dangling open string
   if (inString) {
-    output += '"';
+    if (escape) repaired = repaired.slice(0, -1);
+    repaired += '"';
   }
 
-  // Strip dangling colon, comma, or incomplete key at cutoff point
-  output = output
-    .replace(/,\s*"[^"]*"\s*:\s*$/, "")
-    .replace(/:\s*$/, ": null")
-    .replace(/,\s*$/, "");
+  // Strip dangling colon or comma before closing structures
+  repaired = repaired.replace(/[,:]\s*$/, "");
 
   while (stack.length > 0) {
-    output += stack.pop();
+    repaired += stack.pop();
   }
 
-  return output;
+  return repaired;
 }
