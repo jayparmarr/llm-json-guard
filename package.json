@@ -1,6 +1,6 @@
 {
   "name": "@jayparmarr/llm-json-guard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-dependency parser that extracts, repairs, and parses malformed or truncated JSON from LLM responses.",
   "keywords": [
     "llm",
