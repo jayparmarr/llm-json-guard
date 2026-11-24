@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseLLMJson, parseStreamingJson } from "../src/index.js";
+import { parseLLMJson, parseLLMJsonWithSchema, parseStreamingJson } from "../src/index.js";
 
 describe("parseLLMJson", () => {
   it("parses valid JSON without marking as repaired", () => {
@@ -75,5 +75,39 @@ describe("parseStreamingJson", () => {
       '```json\n{"name": "Project A", "items": ["step 1", "step 2"]}'
     );
     expect(chunk2).toEqual({ name: "Project A", items: ["step 1", "step 2"] });
+  });
+});
+
+describe("parseLLMJsonWithSchema", () => {
+  const userSchema = {
+    safeParse(data: unknown) {
+      if (
+        typeof data === "object" &&
+        data !== null &&
+        typeof (data as { name?: unknown }).name === "string" &&
+        typeof (data as { age?: unknown }).age === "number"
+      ) {
+        return { success: true as const, data: data as { name: string; age: number } };
+      }
+      return { success: false as const, error: { message: "Expected { name: string, age: number }" } };
+    },
+  };
+
+  it("validates repaired JSON against a schema", () => {
+    const res = parseLLMJsonWithSchema(`{name: 'Ada', age: 36,`, userSchema);
+    expect(res).toEqual({
+      ok: true,
+      data: { name: "Ada", age: 36 },
+      repaired: true,
+      rawExtracted: `{name: 'Ada', age: 36,`,
+    });
+  });
+
+  it("returns ok: false when schema validation fails", () => {
+    const res = parseLLMJsonWithSchema(`{"name": "Ada", "age": "thirty-six"}`, userSchema);
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toBe("Expected { name: string, age: number }");
+    }
   });
 });

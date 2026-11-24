@@ -21,6 +21,18 @@ export type ParseResult<T = unknown> =
     };
 
 /**
+ * Structural schema interface compatible with Zod (`z.object(...)`) or custom validators
+ * without adding any runtime dependency.
+ */
+export interface SafeSchema<T> {
+  safeParse: (
+    data: unknown
+  ) =>
+    | { success: true; data: T }
+    | { success: false; error: { message?: string } | unknown };
+}
+
+/**
  * Extracts, repairs, and safely parses JSON from raw LLM text responses.
  */
 export function parseLLMJson<T = unknown>(
@@ -80,6 +92,38 @@ export function parseLLMJson<T = unknown>(
 }
 
 /**
+ * Extracts, repairs, parses, and validates LLM JSON output against a schema
+ * (such as a Zod schema or any object implementing `.safeParse()`).
+ */
+export function parseLLMJsonWithSchema<T>(
+  input: string,
+  schema: SafeSchema<T>,
+  options: ParseOptions = {}
+): ParseResult<T> {
+  const parsed = parseLLMJson<unknown>(input, options);
+  if (!parsed.ok) {
+    return parsed;
+  }
+
+  const validation = schema.safeParse(parsed.data);
+  if (!validation.success) {
+    const errObj = validation.error as { message?: string } | undefined;
+    return {
+      ok: false,
+      error: errObj?.message || "Parsed JSON failed schema validation.",
+      rawExtracted: parsed.rawExtracted,
+    };
+  }
+
+  return {
+    ok: true,
+    data: validation.data,
+    repaired: parsed.repaired,
+    rawExtracted: parsed.rawExtracted,
+  };
+}
+
+/**
  * Parses incomplete/in-flight JSON chunks emitted during LLM token streaming.
  * Returns `null` until at least a partial object or array structure is recoverable.
  */
@@ -95,7 +139,6 @@ export function parseStreamingJson<T = unknown>(partialStream: string): T | null
 function extractJsonCandidate(text: string): string {
   const trimmed = text.trim();
 
-  // 1. Check fenced markdown code blocks (closed or unclosed/truncated)
   const closedFenceMatch = trimmed.match(/```(?:json|JSON)?\s*([\s\S]*?)```/);
   if (closedFenceMatch?.[1]) {
     return closedFenceMatch[1].trim();
@@ -106,7 +149,6 @@ function extractJsonCandidate(text: string): string {
     return openFenceMatch[1].trim();
   }
 
-  // 2. Locate first opening `{` or `[`
   const firstBrace = trimmed.indexOf("{");
   const firstBracket = trimmed.indexOf("[");
 
@@ -121,7 +163,6 @@ function extractJsonCandidate(text: string): string {
 
   const slice = trimmed.slice(start);
 
-  // Trim trailing conversational commentary after the final closing token if balanced
   const lastBrace = slice.lastIndexOf("}");
   const lastBracket = slice.lastIndexOf("]");
   const end = Math.max(lastBrace, lastBracket);
@@ -174,7 +215,6 @@ function normalizeLooseJson(json: string): string {
     out += ch;
   }
 
-  // Quote unquoted object keys outside strings: `{ foo: "bar" }` -> `{ "foo": "bar" }`
   return out.replace(/([{,]\s*)([a-zA-Z_$][a-zA-Z0-9_$-]*)(\s*:)/g, '$1"$2"$3');
 }
 
@@ -274,7 +314,6 @@ function closeTruncatedJson(json: string): string {
     repaired += '"';
   }
 
-  // Strip dangling colon or comma before closing structures
   repaired = repaired.replace(/[,:]\s*$/, "");
 
   while (stack.length > 0) {
